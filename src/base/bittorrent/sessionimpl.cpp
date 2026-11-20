@@ -106,6 +106,7 @@
 #include "bencoderesumedatastorage.h"
 #include "customstorage.h"
 #include "dbresumedatastorage.h"
+#include "diskspaceadmission.h"
 #include "downloadpriority.h"
 #include "extensiondata.h"
 #include "filesearcher.h"
@@ -5501,7 +5502,7 @@ bool SessionImpl::isActiveIncompleteDownload(const TorrentImpl *torrent) const
     // so their resolution is never blocked by the disk space threshold.
     return torrent->hasMetadata() && !torrent->isStopped() && !torrent->isQueued()
             && !torrent->isFinished() && !torrent->isChecking() && !torrent->isMoving()
-            && !torrent->hasError() && torrent->isDownloading();
+            && !torrent->hasError() && (torrent->isDownloading() || torrent->isDiskSpaceLimited());
 }
 
 qint64 SessionImpl::pendingWriteFootprint(const TorrentImpl *torrent) const
@@ -5522,59 +5523,20 @@ qint64 SessionImpl::pendingWriteFootprint(const TorrentImpl *torrent) const
 QHash<QString, SessionImpl::VolumeDiskSpace> SessionImpl::computeVolumeDiskSpaces() const
 {
     QHash<QString, VolumeDiskSpace> volumeDiskSpaces;
-
     for (const TorrentImpl *torrent : asConst(m_torrents))
     {
-        const Path storagePath = torrentStoragePath(torrent);
-        const QString key = volumeKeyForPath(storagePath);
-
-        const auto iter = volumeDiskSpaces.find(key);
-        if (iter != volumeDiskSpaces.end())
-        {
-            iter->pendingSize += pendingWriteFootprint(torrent);
-        }
-        else
-        {
-            // Actual free space is queried only once per volume
-            volumeDiskSpaces.insert(key, VolumeDiskSpace {Utils::Fs::freeDiskSpaceOnPath(storagePath)
-                , pendingWriteFootprint(torrent)});
-        }
+        const Path path = torrentStoragePath(torrent);
+        const QString key = volumeKeyForPath(path);
+        if (!volumeDiskSpaces.contains(key))
+            volumeDiskSpaces.insert(key, VolumeDiskSpace {Utils::Fs::freeDiskSpaceOnPath(path)});
     }
-
     return volumeDiskSpaces;
-}
-
-bool SessionImpl::isBelowMinFreeDiskSpace(const VolumeDiskSpace &volumeDiskSpace) const
-{
-    if (m_minFreeDiskSpace <= 0)
-        return false;
-
-    // Free space is unknown: assume it is sufficient
-    if (volumeDiskSpace.freeSize < 0)
-        return false;
-
-    // The projected free space also accounts for the data that the active torrents
-    // on this volume are still going to write, so torrents which have already
-    // allocated their space aren't stopped/limited unnecessarily and several
-    // sparse torrents added at once cannot collectively overcommit the volume.
-    return (volumeDiskSpace.freeSize - volumeDiskSpace.pendingSize) < m_minFreeDiskSpace;
-}
-
-bool SessionImpl::isBelowMinFreeDiskSpace(const Path &path) const
-{
-    if (m_minFreeDiskSpace <= 0)
-        return false;
-
-    const QHash<QString, VolumeDiskSpace> volumeDiskSpaces = computeVolumeDiskSpaces();
-    const auto iter = volumeDiskSpaces.constFind(volumeKeyForPath(path));
-    return ((iter != volumeDiskSpaces.cend()) && isBelowMinFreeDiskSpace(*iter));
 }
 
 void SessionImpl::enforceDiskSpaceThreshold()
 {
     if (m_minFreeDiskSpace <= 0)
     {
-        // Threshold is disabled: release all previously limited torrents
         for (const TorrentID &id : asConst(m_diskSpaceLimitedTorrents))
         {
             if (TorrentImpl *torrent = m_torrents.value(id))
@@ -5584,47 +5546,68 @@ void SessionImpl::enforceDiskSpaceThreshold()
         return;
     }
 
-    const QHash<QString, VolumeDiskSpace> volumeDiskSpaces = computeVolumeDiskSpaces();
+    const auto volumeDiskSpaces = computeVolumeDiskSpaces();
+    QHash<QString, QList<DiskSpaceAdmission::Candidate>> candidatesByVolume;
+
+    for (const TorrentImpl *torrent : asConst(m_torrents))
+    {
+        if (!isActiveIncompleteDownload(torrent))
+            continue;
+
+        candidatesByVolume[volumeKeyForPath(torrentStoragePath(torrent))].append({
+            .id = torrent->id().toString(),
+            .pendingBytes = pendingWriteFootprint(torrent),
+            .queuePosition = torrent->queuePosition(),
+            .previouslyAdmitted = !torrent->isDiskSpaceLimited()
+        });
+    }
+
+    QSet<QString> admitted;
+    for (auto iter = candidatesByVolume.cbegin(); iter != candidatesByVolume.cend(); ++iter)
+    {
+        const VolumeDiskSpace volume = volumeDiskSpaces.value(iter.key());
+        admitted.unite(DiskSpaceAdmission::select(iter.value(), volume.freeSize, m_minFreeDiskSpace));
+    }
 
     int limitedCount = 0;
     int releasedCount = 0;
-
     for (TorrentImpl *torrent : asConst(m_torrents))
     {
-        // Stopped torrents are skipped here and re-evaluated when they get started
+        // Stopped torrents keep their manual state and are reconsidered on start.
         if (torrent->isStopped())
             continue;
 
-        const auto iter = volumeDiskSpaces.constFind(volumeKeyForPath(torrentStoragePath(torrent)));
-        if (iter == volumeDiskSpaces.cend())
-            continue;
-
-        if (isActiveIncompleteDownload(torrent) && isBelowMinFreeDiskSpace(*iter))
+        const bool shouldLimit = isActiveIncompleteDownload(torrent)
+                && !admitted.contains(torrent->id().toString());
+        const bool wasLimited = m_diskSpaceLimitedTorrents.contains(torrent->id());
+        if (shouldLimit && !wasLimited)
         {
-            if (!m_diskSpaceLimitedTorrents.contains(torrent->id()))
-            {
-                m_diskSpaceLimitedTorrents.insert(torrent->id());
-                torrent->setDiskSpaceLimited(true);
-                ++limitedCount;
-            }
+            m_diskSpaceLimitedTorrents.insert(torrent->id());
+            torrent->setDiskSpaceLimited(true);
+            ++limitedCount;
         }
-        else if (m_diskSpaceLimitedTorrents.contains(torrent->id()))
+        else if (!shouldLimit && wasLimited)
         {
             m_diskSpaceLimitedTorrents.remove(torrent->id());
             torrent->setDiskSpaceLimited(false);
             ++releasedCount;
         }
+        else if (shouldLimit)
+        {
+            // Reassert our restriction if libtorrent cleared upload_mode.
+            torrent->setDiskSpaceLimited(true);
+        }
     }
 
     if (limitedCount > 0)
     {
-        LogMsg(tr("Free disk space is below the minimum threshold (%1 MiB). %2 torrent(s) have been switched to \"upload only\" mode.")
-            .arg(QString::number(m_minFreeDiskSpace / (1024 * 1024)), QString::number(limitedCount)), Log::WARNING);
+        LogMsg(tr("Not enough unreserved disk space. %1 torrent(s) switched to \"upload only\" mode.")
+            .arg(limitedCount), Log::WARNING);
     }
     if (releasedCount > 0)
     {
-        LogMsg(tr("Free disk space is above the minimum threshold (%1 MiB). %2 torrent(s) have been allowed to resume downloading.")
-            .arg(QString::number(m_minFreeDiskSpace / (1024 * 1024)), QString::number(releasedCount)), Log::INFO);
+        LogMsg(tr("Disk space reservations updated. %1 torrent(s) can resume downloading.")
+            .arg(releasedCount), Log::INFO);
     }
 }
 
@@ -5846,18 +5829,8 @@ void SessionImpl::handleTorrentStarted(TorrentImpl *const torrent)
     LogMsg(tr("Torrent resumed. Torrent: \"%1\"").arg(torrent->name()));
     emit torrentStarted(torrent);
 
-    if (isActiveIncompleteDownload(torrent)
-            && !m_diskSpaceLimitedTorrents.contains(torrent->id())
-            && isBelowMinFreeDiskSpace(torrentStoragePath(torrent)))
-    {
-        // The flag is owned by the disk space enforcement logic: a manually resumed
-        // torrent isn't blocked here, but it will be switched back to "upload only"
-        // mode by the next enforcement pass if free space is still insufficient.
-        m_diskSpaceLimitedTorrents.insert(torrent->id());
-        torrent->setDiskSpaceLimited(true);
-        LogMsg(tr("Free disk space is below the minimum threshold (%1 MiB). \"%2\" is switched to \"upload only\" mode.")
-            .arg(QString::number(m_minFreeDiskSpace / (1024 * 1024)), torrent->name()), Log::WARNING);
-    }
+    if (isRestored())
+        enforceDiskSpaceThreshold();
 }
 
 void SessionImpl::handleTorrentChecked(TorrentImpl *const torrent)
@@ -6497,14 +6470,9 @@ TorrentImpl *SessionImpl::createTorrent(const lt::torrent_handle &nativeHandle, 
     if (torrent->hasError())
         LogMsg(tr("Torrent errored. Torrent: \"%1\". Error: \"%2\"").arg(torrent->name(), torrent->error()), Log::WARNING);
 
-    if (isActiveIncompleteDownload(torrent)
-            && isBelowMinFreeDiskSpace(torrentStoragePath(torrent)))
-    {
-        m_diskSpaceLimitedTorrents.insert(torrent->id());
-        torrent->setDiskSpaceLimited(true);
-        LogMsg(tr("Free disk space is below the minimum threshold (%1 MiB). \"%2\" is added in \"upload only\" mode.")
-            .arg(QString::number(m_minFreeDiskSpace / (1024 * 1024)), torrent->name()), Log::WARNING);
-    }
+    // Startup already has a single enforcement pass after loading all torrents.
+    if (isRestored())
+        enforceDiskSpaceThreshold();
 
     return torrent;
 }

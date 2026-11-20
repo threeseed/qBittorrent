@@ -654,17 +654,12 @@ namespace BitTorrent
 
         struct VolumeDiskSpace
         {
-            // Actual free space on the volume (-1 if it cannot be determined)
             qint64 freeSize = -1;
-            // Sum of pending (not yet allocated) write footprints of torrents on the volume
-            qint64 pendingSize = 0;
         };
 
         bool isActiveIncompleteDownload(const TorrentImpl *torrent) const;
         qint64 pendingWriteFootprint(const TorrentImpl *torrent) const;
         QHash<QString, VolumeDiskSpace> computeVolumeDiskSpaces() const;
-        bool isBelowMinFreeDiskSpace(const VolumeDiskSpace &volumeDiskSpace) const;
-        bool isBelowMinFreeDiskSpace(const Path &path) const;
         void enforceDiskSpaceThreshold();
         QList<TorrentImpl *> getQueuedTorrentsByID(const QList<TorrentID> &torrentIDs) const;
 

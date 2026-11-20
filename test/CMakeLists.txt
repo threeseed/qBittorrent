@@ -12,6 +12,7 @@ set(testFiles
     testbittorrenttrackerentry.cpp
     testconceptsexplicitlyconvertibleto.cpp
     testconceptsstringable.cpp
+    testdiskspaceadmission.cpp
     testglobal.cpp
     testhttprequestparser.cpp
     testorderedset.cpp

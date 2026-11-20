@@ -1357,10 +1357,10 @@ bool TorrentImpl::hasMissingFiles() const
 
 bool TorrentImpl::hasError() const
 {
-    // upload_mode set due to insufficient disk space isn't a torrent error
+    // A disk-space restriction is not an error, but libtorrent can set
+    // upload_mode independently when a write fails.
     return (m_nativeStatus.errc
-            || ((m_nativeStatus.flags & lt::torrent_flags::upload_mode)
-                && (!m_isDiskSpaceLimited || m_lastFileError.error)));
+            || ((m_nativeStatus.flags & lt::torrent_flags::upload_mode) && !m_diskSpaceOwnsUploadMode));
 }
 
 int TorrentImpl::queuePosition() const
@@ -1379,8 +1379,7 @@ QString TorrentImpl::error() const
 #endif
     }
 
-    if ((m_nativeStatus.flags & lt::torrent_flags::upload_mode)
-        && (!m_isDiskSpaceLimited || m_lastFileError.error))
+    if ((m_nativeStatus.flags & lt::torrent_flags::upload_mode) && !m_diskSpaceOwnsUploadMode)
     {
         return tr("Couldn't write to file. Reason: \"%1\". Torrent is now in \"upload only\" mode.")
 #if LIBTORRENT_VERSION_NUM >= 20100
@@ -1995,6 +1994,11 @@ void TorrentImpl::reload()
 
         m_nativeHandle = m_session->reloadTorrent(m_nativeHandle, std::move(p));
         m_nativeStatus = static_cast<ExtensionData *>(m_nativeHandle.userdata())->status;
+        if (m_isDiskSpaceLimited && m_diskSpaceOwnsUploadMode)
+        {
+            m_nativeHandle.set_flags(lt::torrent_flags::upload_mode);
+            m_nativeStatus.flags |= lt::torrent_flags::upload_mode;
+        }
 
         if (queuePos >= lt::queue_position_t {})
             m_nativeHandle.queue_position_set(queuePos);
@@ -2026,19 +2030,40 @@ bool TorrentImpl::isDiskSpaceLimited() const
 
 void TorrentImpl::setDiskSpaceLimited(const bool limited)
 {
+    constexpr auto uploadMode = lt::torrent_flags::upload_mode;
     if (m_isDiskSpaceLimited == limited)
+    {
+        // Libtorrent's auto-management may clear upload_mode. Reassert it
+        // only if this feature still owns the flag.
+        if (limited && m_diskSpaceOwnsUploadMode && !(m_nativeStatus.flags & uploadMode))
+        {
+            m_nativeHandle.set_flags(uploadMode);
+            m_nativeStatus.flags |= uploadMode;
+        }
         return;
+    }
 
     m_isDiskSpaceLimited = limited;
-    if (m_isDiskSpaceLimited)
+    if (limited)
     {
-        m_nativeHandle.set_flags(lt::torrent_flags::upload_mode);
-        m_nativeStatus.flags |= lt::torrent_flags::upload_mode;  // prevent return cached value
+        // Do not claim ownership when upload_mode was already set.
+        m_diskSpaceOwnsUploadMode = !(m_nativeStatus.flags & uploadMode);
+        if (m_diskSpaceOwnsUploadMode)
+        {
+            m_nativeHandle.set_flags(uploadMode);
+            m_nativeStatus.flags |= uploadMode;
+        }
     }
-    else if (!m_lastFileError.error)
+    else
     {
-        m_nativeHandle.unset_flags(lt::torrent_flags::upload_mode);
-        m_nativeStatus.flags &= ~lt::torrent_flags::upload_mode;  // prevent return cached value
+        // File I/O errors are owned by libtorrent. Clearing a reservation
+        // must not undo the safety mechanism that prevents further writes.
+        if (m_diskSpaceOwnsUploadMode && !m_nativeStatus.errc && !m_lastFileError.error)
+        {
+            m_nativeHandle.unset_flags(uploadMode);
+            m_nativeStatus.flags &= ~uploadMode;
+        }
+        m_diskSpaceOwnsUploadMode = false;
     }
 
     updateState();
@@ -2068,8 +2093,17 @@ void TorrentImpl::start(const TorrentOperatingMode mode)
     if (hasError())
     {
         m_nativeHandle.clear_error();
-        if (!m_isDiskSpaceLimited)
-            m_nativeHandle.unset_flags(lt::torrent_flags::upload_mode);
+        m_nativeHandle.unset_flags(lt::torrent_flags::upload_mode);
+        m_nativeStatus.flags &= ~lt::torrent_flags::upload_mode;
+        m_nativeStatus.errc.clear();
+        m_lastFileError = {};
+        if (m_isDiskSpaceLimited)
+        {
+            // Explicit error recovery must not bypass an active disk limit.
+            m_diskSpaceOwnsUploadMode = true;
+            m_nativeHandle.set_flags(lt::torrent_flags::upload_mode);
+            m_nativeStatus.flags |= lt::torrent_flags::upload_mode;
+        }
     }
 
     m_operatingMode = mode;
@@ -2558,6 +2592,8 @@ void TorrentImpl::handleFileCompleted(const lt::file_index_t nativeFileIndex)
 void TorrentImpl::handleFileError(FileErrorInfo fileError)
 {
     m_lastFileError = std::move(fileError);
+    if (m_isDiskSpaceLimited)
+        m_diskSpaceOwnsUploadMode = false;
 }
 
 void TorrentImpl::handleMetadataReceived()

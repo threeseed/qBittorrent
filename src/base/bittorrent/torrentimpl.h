@@ -383,6 +383,8 @@ namespace BitTorrent
         bool m_useAutoTMM = false;
         bool m_isStopped = false;
         bool m_isDiskSpaceLimited = false;
+        // True only while this feature owns libtorrent's upload_mode flag.
+        bool m_diskSpaceOwnsUploadMode = false;
         StopCondition m_stopCondition = StopCondition::None;
         SSLParameters m_sslParams;
 
